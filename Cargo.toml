@@ -4,9 +4,8 @@ version = "0.0.1"
 edition = "2024"
 license = "CC0-1.0"
 
-[package.metadata.bundle]
+[package.metadata.bundle.bin.stardrift]
 name = "Stardrift"
-identifier = "game.est"
 category = "Game"
 
 [profile.dev]
