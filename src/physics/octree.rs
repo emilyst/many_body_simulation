@@ -18,19 +18,105 @@ pub struct OctreeStats {
     pub force_calculation_count: u64,
 }
 
+/// Optimized node pool using Vec-based storage with indices
 #[derive(Debug)]
-pub struct OctreeNodePool {
-    internal_nodes: VecDeque<Box<[Option<OctreeNode>; 8]>>,
-    external_bodies: VecDeque<Vec<OctreeBody>>,
+pub struct OptimizedOctreeNodePool {
+    nodes: Vec<OptimizedOctreeNode>,
+    free_indices: Vec<u32>,
+    next_index: u32,
 }
 
-impl Default for OctreeNodePool {
+impl Default for OptimizedOctreeNodePool {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl OctreeNodePool {
+impl OptimizedOctreeNodePool {
+    pub fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            free_indices: Vec::new(),
+            next_index: 0,
+        }
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            nodes: Vec::with_capacity(capacity),
+            free_indices: Vec::with_capacity(capacity / 4),
+            next_index: 0,
+        }
+    }
+
+    pub fn allocate_node(&mut self, node: OptimizedOctreeNode) -> u32 {
+        if let Some(index) = self.free_indices.pop() {
+            self.nodes[index as usize] = node;
+            index
+        } else {
+            let index = self.next_index;
+            self.nodes.push(node);
+            self.next_index += 1;
+            index
+        }
+    }
+
+    pub fn get_node(&self, index: u32) -> Option<&OptimizedOctreeNode> {
+        self.nodes.get(index as usize)
+    }
+
+    pub fn get_node_mut(&mut self, index: u32) -> Option<&mut OptimizedOctreeNode> {
+        self.nodes.get_mut(index as usize)
+    }
+
+    pub fn deallocate_node(&mut self, index: u32) {
+        if (index as usize) < self.nodes.len() {
+            // Clear the node data to prevent memory leaks
+            if let Some(node) = self.nodes.get_mut(index as usize) {
+                node.bodies.clear();
+                node.cold_data.children_indices = [None; 8];
+            }
+            self.free_indices.push(index);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+        self.free_indices.clear();
+        self.next_index = 0;
+    }
+
+    pub fn stats(&self) -> (usize, usize) {
+        (self.nodes.len(), self.free_indices.len())
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.nodes.capacity()
+    }
+
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+}
+
+/// Legacy node pool for compatibility during transition
+#[derive(Debug)]
+pub struct LegacyOctreeNodePool {
+    internal_nodes: VecDeque<Box<[Option<OctreeNode>; 8]>>,
+    external_bodies: VecDeque<Vec<OctreeBody>>,
+}
+
+impl Default for LegacyOctreeNodePool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LegacyOctreeNodePool {
     pub fn new() -> Self {
         Self {
             internal_nodes: VecDeque::new(),
@@ -151,19 +237,468 @@ impl Aabb3d {
     }
 }
 
+/// Optimized octree with improved memory layout and cache performance
 #[derive(Debug)]
-pub struct Octree {
-    pub root: Option<OctreeNode>,
-    pub theta: Scalar,                  // Barnes-Hut approximation parameter
-    pub min_distance: Scalar,           // Minimum distance for force calculation
-    pub max_force: Scalar,              // Maximum force magnitude
-    pub leaf_threshold: usize,          // Maximum bodies per leaf node
-    min_distance_squared: Scalar,       // Cached value to avoid repeated multiplication
-    octree_node_pool: OctreeNodePool,   // Pool for reusing node allocations
+pub struct OptimizedOctree {
+    pub root_index: Option<u32>,  // Index to root node instead of pointer
+    pub theta: Scalar,            // Barnes-Hut approximation parameter
+    pub min_distance: Scalar,     // Minimum distance for force calculation
+    pub max_force: Scalar,        // Maximum force magnitude
+    pub leaf_threshold: usize,    // Maximum bodies per leaf node
+    min_distance_squared: Scalar, // Cached value to avoid repeated multiplication
+    node_pool: OptimizedOctreeNodePool, // Optimized pool with index-based storage
     force_calculation_count: AtomicU64, // Counter for force calculations performed
 }
 
-impl Octree {
+impl OptimizedOctree {
+    pub fn new(theta: Scalar, min_distance: Scalar, max_force: Scalar) -> Self {
+        Self {
+            root_index: None,
+            theta,
+            min_distance,
+            max_force,
+            leaf_threshold: 4,
+            min_distance_squared: min_distance * min_distance,
+            node_pool: OptimizedOctreeNodePool::new(),
+            force_calculation_count: AtomicU64::new(0),
+        }
+    }
+
+    pub fn with_leaf_threshold(mut self, leaf_threshold: usize) -> Self {
+        self.leaf_threshold = leaf_threshold;
+        self
+    }
+
+    pub fn with_pool_capacity(
+        theta: Scalar,
+        min_distance: Scalar,
+        max_force: Scalar,
+        capacity: usize,
+    ) -> Self {
+        Self {
+            root_index: None,
+            theta,
+            min_distance,
+            max_force,
+            leaf_threshold: 4,
+            min_distance_squared: min_distance * min_distance,
+            node_pool: OptimizedOctreeNodePool::with_capacity(capacity),
+            force_calculation_count: AtomicU64::new(0),
+        }
+    }
+
+    pub fn pool_stats(&self) -> (usize, usize) {
+        self.node_pool.stats()
+    }
+
+    pub fn octree_stats(&self) -> OctreeStats {
+        match self.root_index {
+            Some(root_index) => {
+                if let Some(root) = self.node_pool.get_node(root_index) {
+                    OctreeStats {
+                        node_count: self.count_nodes_recursive(root_index),
+                        body_count: root.body_count(),
+                        total_mass: root.total_mass(),
+                        center_of_mass: root.center_of_mass(),
+                        force_calculation_count: self
+                            .force_calculation_count
+                            .load(Ordering::Relaxed),
+                    }
+                } else {
+                    OctreeStats::default()
+                }
+            }
+            None => OctreeStats::default(),
+        }
+    }
+
+    fn count_nodes_recursive(&self, node_index: u32) -> usize {
+        if let Some(node) = self.node_pool.get_node(node_index) {
+            if node.is_internal() {
+                1 + node
+                    .cold_data
+                    .children_indices
+                    .iter()
+                    .filter_map(|&child_index| child_index)
+                    .map(|child_index| self.count_nodes_recursive(child_index))
+                    .sum::<usize>()
+            } else {
+                1
+            }
+        } else {
+            0
+        }
+    }
+
+    pub fn clear_pool(&mut self) {
+        self.node_pool.clear();
+        self.root_index = None;
+    }
+
+    /// Get a reference to the root node, if it exists
+    pub fn root_node(&self) -> Option<&OptimizedOctreeNode> {
+        self.root_index
+            .and_then(|index| self.node_pool.get_node(index))
+    }
+
+    pub fn get_bounds(&self, max_depth: Option<usize>) -> Vec<Aabb3d> {
+        let estimated_capacity = match max_depth {
+            Some(depth) => (0..=depth)
+                .map(|d| 8_usize.pow(d as u32))
+                .sum::<usize>()
+                .min(1024),
+            None => 64,
+        };
+        let mut bounds = Vec::with_capacity(estimated_capacity);
+        if let Some(root_index) = self.root_index {
+            self.collect_bounds_recursive(root_index, &mut bounds, 0, max_depth);
+        }
+        bounds
+    }
+
+    fn collect_bounds_recursive(
+        &self,
+        node_index: u32,
+        bounds: &mut Vec<Aabb3d>,
+        current_depth: usize,
+        max_depth: Option<usize>,
+    ) {
+        if let Some(max_depth) = max_depth {
+            if current_depth > max_depth {
+                return;
+            }
+        }
+
+        if let Some(node) = self.node_pool.get_node(node_index) {
+            bounds.push(node.bounds());
+
+            if node.is_internal() {
+                for &child_index in &node.cold_data.children_indices {
+                    if let Some(child_index) = child_index {
+                        self.collect_bounds_recursive(
+                            child_index,
+                            bounds,
+                            current_depth + 1,
+                            max_depth,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Calculate gravitational force on a body using the optimized octree
+    pub fn calculate_force(&self, body: &OctreeBody, g: Scalar) -> Vector {
+        match self.root_index {
+            Some(root_index) => {
+                self.force_calculation_count.fetch_add(1, Ordering::Relaxed);
+                self.calculate_force_recursive(body, root_index, g)
+            }
+            None => Vector::ZERO,
+        }
+    }
+
+    fn calculate_force_recursive(&self, body: &OctreeBody, node_index: u32, g: Scalar) -> Vector {
+        let node = match self.node_pool.get_node(node_index) {
+            Some(node) => node,
+            None => return Vector::ZERO,
+        };
+
+        if node.is_external() {
+            // Direct force calculation for leaf nodes
+            let mut total_force = Vector::ZERO;
+            for other_body in node.bodies.iter() {
+                if other_body.entity != body.entity {
+                    total_force += self.calculate_direct_force(body, &other_body, g);
+                }
+            }
+            total_force
+        } else {
+            // Barnes-Hut approximation for internal nodes
+            let distance_to_center = (body.position - node.hot_data.center_of_mass).length();
+            let node_size = node.hot_data.bounds_size.length();
+
+            if node_size / distance_to_center < self.theta {
+                // Use approximation
+                self.calculate_force_from_point(
+                    body,
+                    node.hot_data.center_of_mass,
+                    node.hot_data.total_mass,
+                    g,
+                )
+            } else {
+                // Recurse into children
+                let mut total_force = Vector::ZERO;
+                for &child_index in &node.cold_data.children_indices {
+                    if let Some(child_index) = child_index {
+                        total_force += self.calculate_force_recursive(body, child_index, g);
+                    }
+                }
+                total_force
+            }
+        }
+    }
+
+    #[inline]
+    fn calculate_force_from_point(
+        &self,
+        body: &OctreeBody,
+        other_position: Vector,
+        other_mass: Scalar,
+        g: Scalar,
+    ) -> Vector {
+        let direction = other_position - body.position;
+        let distance_squared = direction.length_squared().max(self.min_distance_squared);
+        let distance = distance_squared.sqrt();
+
+        let force_magnitude = (g * body.mass * other_mass / distance_squared).min(self.max_force);
+        let direction_normalized = direction / distance;
+
+        direction_normalized * force_magnitude
+    }
+
+    #[inline]
+    fn calculate_direct_force(&self, body1: &OctreeBody, body2: &OctreeBody, g: Scalar) -> Vector {
+        self.calculate_force_from_point(body1, body2.position, body2.mass, g)
+    }
+
+    /// Estimate the required node pool capacity based on body count and leaf threshold
+    /// Uses a conservative estimate that overcommits memory to avoid reallocations
+    fn estimate_node_capacity(&self, body_count: usize) -> usize {
+        if body_count <= self.leaf_threshold {
+            // Single root node for small body counts
+            return 1;
+        }
+
+        // Conservative estimation: assume worst-case tree depth and branching
+        // Each internal node can have up to 8 children
+        // Estimate nodes needed: ~N/leaf_threshold * 2 for internal nodes + safety margin
+        let estimated_leaf_nodes = body_count.div_ceil(self.leaf_threshold);
+        let estimated_internal_nodes = estimated_leaf_nodes.saturating_sub(1) / 7; // (8^k - 1) / 7 for k levels
+        let total_estimated = estimated_leaf_nodes + estimated_internal_nodes;
+
+        // Add 50% safety margin to avoid reallocations (better to overcommit memory)
+        let with_margin = total_estimated * 3 / 2;
+
+        // Cap at reasonable maximum to prevent excessive memory usage
+        with_margin.min(body_count * 2).max(16)
+    }
+
+    /// Build the optimized octree from a collection of bodies
+    pub fn build(&mut self, bodies: impl IntoIterator<Item = OctreeBody>) {
+        // Clear existing tree
+        if let Some(old_root_index) = self.root_index.take() {
+            self.deallocate_tree_recursive(old_root_index);
+        }
+
+        let mut bodies_iter = bodies.into_iter();
+
+        let first_body = match bodies_iter.next() {
+            Some(body) => body,
+            None => {
+                self.root_index = None;
+                return;
+            }
+        };
+
+        // Calculate bounding box and collect all bodies
+        let mut min = first_body.position;
+        let mut max = first_body.position;
+        let mut all_bodies = vec![first_body];
+
+        for body in bodies_iter {
+            min = min.min(body.position);
+            max = max.max(body.position);
+            all_bodies.push(body);
+        }
+
+        // Pre-allocate node pool with estimated capacity
+        let estimated_capacity = self.estimate_node_capacity(all_bodies.len());
+        if self.node_pool.capacity() < estimated_capacity {
+            // Only reallocate if current capacity is insufficient
+            self.node_pool = OptimizedOctreeNodePool::with_capacity(estimated_capacity);
+        } else {
+            // Clear existing nodes but keep capacity
+            self.node_pool.clear();
+        }
+
+        // Expand bounds slightly to ensure all bodies are inside
+        let expansion = (max - min) * 0.01;
+        min -= expansion;
+        max += expansion;
+
+        let root_bounds = Aabb3d::new(min, max);
+
+        // Create root node
+        if all_bodies.len() <= self.leaf_threshold {
+            // Create external root node
+            let mut root_node = OptimizedOctreeNode::new_external(root_bounds, all_bodies.len());
+            for body in all_bodies {
+                root_node.add_body(body.entity, body.position, body.mass);
+            }
+            self.root_index = Some(self.node_pool.allocate_node(root_node));
+        } else {
+            // Create internal root node
+            let root_node = OptimizedOctreeNode::new_internal(root_bounds, Vector::ZERO, 0.0);
+            let root_index = self.node_pool.allocate_node(root_node);
+            self.root_index = Some(root_index);
+
+            // Build tree recursively
+            self.build_recursive(root_index, all_bodies);
+        }
+    }
+
+    fn build_recursive(&mut self, node_index: u32, bodies: Vec<OctreeBody>) {
+        if bodies.len() <= self.leaf_threshold {
+            // Convert to external node
+            if let Some(node) = self.node_pool.get_node_mut(node_index) {
+                node.cold_data.node_type = NodeType::External;
+                for body in bodies {
+                    node.add_body(body.entity, body.position, body.mass);
+                }
+            }
+            return;
+        }
+
+        // Get node bounds for subdivision
+        let bounds = if let Some(node) = self.node_pool.get_node(node_index) {
+            node.bounds()
+        } else {
+            return;
+        };
+
+        let child_bounds = bounds.subdivide_into_children();
+        let mut child_bodies: [Vec<OctreeBody>; 8] = Default::default();
+
+        // Distribute bodies to children
+        for body in bodies {
+            let child_index = self.determine_child_index(&body.position, &bounds);
+            child_bodies[child_index].push(body);
+        }
+
+        // Create child nodes
+        let mut total_mass = 0.0;
+        let mut weighted_position_sum = Vector::ZERO;
+        let mut total_body_count = 0;
+
+        for (i, bodies_for_child) in child_bodies.into_iter().enumerate() {
+            if !bodies_for_child.is_empty() {
+                let is_leaf = bodies_for_child.len() <= self.leaf_threshold;
+
+                let child_node = if is_leaf {
+                    // Create external child
+                    let mut child =
+                        OptimizedOctreeNode::new_external(child_bounds[i], bodies_for_child.len());
+                    for body in &bodies_for_child {
+                        child.add_body(body.entity, body.position, body.mass);
+                        total_mass += body.mass;
+                        weighted_position_sum += body.position * body.mass;
+                        total_body_count += 1;
+                    }
+                    child
+                } else {
+                    // Create internal child
+                    let child =
+                        OptimizedOctreeNode::new_internal(child_bounds[i], Vector::ZERO, 0.0);
+                    for body in &bodies_for_child {
+                        total_mass += body.mass;
+                        weighted_position_sum += body.position * body.mass;
+                        total_body_count += 1;
+                    }
+                    child
+                };
+
+                let child_index = self.node_pool.allocate_node(child_node);
+
+                // Set child reference in parent
+                if let Some(parent_node) = self.node_pool.get_node_mut(node_index) {
+                    parent_node.set_child_index(i, Some(child_index));
+                }
+
+                // Recursively build child if it's internal
+                if !is_leaf {
+                    self.build_recursive(child_index, bodies_for_child);
+                }
+            }
+        }
+
+        // Update parent node's center of mass and total mass
+        if let Some(parent_node) = self.node_pool.get_node_mut(node_index) {
+            let center_of_mass = if total_mass > 0.0 {
+                weighted_position_sum / total_mass
+            } else {
+                Vector::ZERO
+            };
+            parent_node.update_internal_data(center_of_mass, total_mass, total_body_count);
+        }
+    }
+
+    /// Optimized child index calculation using efficient bit manipulation
+    #[inline(always)]
+    fn determine_child_index(&self, position: &Vector, bounds: &Aabb3d) -> usize {
+        let center = bounds.center();
+
+        // Use direct bit manipulation for maximum performance
+        let dx = (position.x >= center.x) as usize;
+        let dy = (position.y >= center.y) as usize;
+        let dz = (position.z >= center.z) as usize;
+
+        // Combine bits: x=1, y=2, z=4
+        dx | (dy << 1) | (dz << 2)
+    }
+
+    fn deallocate_tree_recursive(&mut self, node_index: u32) {
+        // Collect child indices first to avoid borrowing conflicts
+        let child_indices = if let Some(node) = self.node_pool.get_node(node_index) {
+            if node.is_internal() {
+                node.cold_data
+                    .children_indices
+                    .iter()
+                    .filter_map(|&child_index| child_index)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Recursively deallocate children
+        for child_index in child_indices {
+            self.deallocate_tree_recursive(child_index);
+        }
+
+        // Deallocate this node
+        self.node_pool.deallocate_node(node_index);
+    }
+}
+
+impl Default for OctreeStats {
+    fn default() -> Self {
+        Self {
+            node_count: 0,
+            body_count: 0,
+            total_mass: 0.0,
+            center_of_mass: Vector::ZERO,
+            force_calculation_count: 0,
+        }
+    }
+}
+
+/// Legacy octree implementation for compatibility during transition
+#[derive(Debug)]
+pub struct LegacyOctree {
+    pub root: Option<OctreeNode>,
+    pub theta: Scalar,                      // Barnes-Hut approximation parameter
+    pub min_distance: Scalar,               // Minimum distance for force calculation
+    pub max_force: Scalar,                  // Maximum force magnitude
+    pub leaf_threshold: usize,              // Maximum bodies per leaf node
+    min_distance_squared: Scalar,           // Cached value to avoid repeated multiplication
+    octree_node_pool: LegacyOctreeNodePool, // Pool for reusing node allocations
+    force_calculation_count: AtomicU64,     // Counter for force calculations performed
+}
+
+impl LegacyOctree {
     pub fn new(theta: Scalar, min_distance: Scalar, max_force: Scalar) -> Self {
         Self {
             root: None,
@@ -172,7 +707,7 @@ impl Octree {
             max_force,
             leaf_threshold: 4,
             min_distance_squared: min_distance * min_distance,
-            octree_node_pool: OctreeNodePool::new(),
+            octree_node_pool: LegacyOctreeNodePool::new(),
             force_calculation_count: AtomicU64::new(0),
         }
     }
@@ -196,7 +731,10 @@ impl Octree {
             max_force,
             leaf_threshold: 4,
             min_distance_squared: min_distance * min_distance,
-            octree_node_pool: OctreeNodePool::with_capacity(internal_capacity, external_capacity),
+            octree_node_pool: LegacyOctreeNodePool::with_capacity(
+                internal_capacity,
+                external_capacity,
+            ),
             force_calculation_count: AtomicU64::new(0),
         }
     }
@@ -293,7 +831,7 @@ impl Octree {
         bounds: Aabb3d,
         bodies: Vec<OctreeBody>,
         leaf_threshold: usize,
-        pool: &mut OctreeNodePool,
+        pool: &mut LegacyOctreeNodePool,
     ) -> OctreeNode {
         if bodies.len() <= leaf_threshold {
             let pooled_bodies = pool.get_external_bodies(bodies.len());
@@ -447,13 +985,261 @@ impl Octree {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct OctreeBody {
-    pub entity: Entity,
-    pub position: Vector,
-    pub mass: Scalar,
+/// Optimized Struct-of-Arrays layout for better cache locality
+#[derive(Debug, Clone)]
+pub struct OptimizedOctreeBodies {
+    pub entities: Vec<Entity>,
+    pub positions: Vec<Vector>,
+    pub masses: Vec<Scalar>,
 }
 
+impl OptimizedOctreeBodies {
+    pub fn new() -> Self {
+        Self {
+            entities: Vec::new(),
+            positions: Vec::new(),
+            masses: Vec::new(),
+        }
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entities: Vec::with_capacity(capacity),
+            positions: Vec::with_capacity(capacity),
+            masses: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entities.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entities.is_empty()
+    }
+
+    pub fn push(&mut self, entity: Entity, position: Vector, mass: Scalar) {
+        self.entities.push(entity);
+        self.positions.push(position);
+        self.masses.push(mass);
+    }
+
+    pub fn clear(&mut self) {
+        self.entities.clear();
+        self.positions.clear();
+        self.masses.clear();
+    }
+
+    pub fn get(&self, index: usize) -> Option<OctreeBody> {
+        if index < self.len() {
+            Some(OctreeBody {
+                entity: self.entities[index],
+                position: self.positions[index],
+                mass: self.masses[index],
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = OctreeBody> + '_ {
+        (0..self.len()).map(move |i| OctreeBody {
+            entity: self.entities[i],
+            position: self.positions[i],
+            mass: self.masses[i],
+        })
+    }
+
+    pub fn total_mass(&self) -> Scalar {
+        self.masses.iter().sum()
+    }
+
+    pub fn center_of_mass(&self) -> Vector {
+        if self.is_empty() {
+            return Vector::ZERO;
+        }
+
+        let total_mass = self.total_mass();
+        if total_mass > 0.0 {
+            let weighted_sum = self
+                .positions
+                .iter()
+                .zip(self.masses.iter())
+                .map(|(pos, mass)| *pos * *mass)
+                .fold(Vector::ZERO, |acc, pos| acc + pos);
+            weighted_sum / total_mass
+        } else {
+            Vector::ZERO
+        }
+    }
+}
+
+impl Default for OptimizedOctreeBodies {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Individual body representation for compatibility
+#[derive(Debug, Clone, Copy)]
+#[repr(C)] // Explicit layout control for better alignment
+pub struct OctreeBody {
+    pub position: Vector, // 24 bytes (largest first for alignment)
+    pub entity: Entity,   // 8 bytes
+    pub mass: Scalar,     // 8 bytes
+}
+
+/// Hot data: frequently accessed during force calculations
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct HotNodeData {
+    pub center_of_mass: Vector, // 24 bytes
+    pub total_mass: Scalar,     // 8 bytes
+    pub bounds_center: Vector,  // 24 bytes
+    pub bounds_size: Vector,    // 24 bytes
+}
+
+/// Cold data: accessed during tree construction
+#[derive(Debug, Clone)]
+#[repr(C)]
+pub struct ColdNodeData {
+    pub bounds: Aabb3d,                     // 48 bytes
+    pub children_indices: [Option<u32>; 8], // 32 bytes (indices instead of pointers)
+    pub body_count: u32,                    // 4 bytes
+    pub node_type: NodeType,                // 1 byte
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(u8)]
+pub enum NodeType {
+    Internal = 0,
+    External = 1,
+}
+
+/// Optimized octree node with separated hot/cold data
+#[derive(Debug, Clone)]
+#[repr(C)]
+pub struct OptimizedOctreeNode {
+    pub hot_data: HotNodeData,
+    pub cold_data: ColdNodeData,
+    pub bodies: OptimizedOctreeBodies, // Only used for external nodes
+}
+
+impl OptimizedOctreeNode {
+    pub fn new_internal(bounds: Aabb3d, center_of_mass: Vector, total_mass: Scalar) -> Self {
+        let bounds_center = bounds.center();
+        let bounds_size = bounds.size();
+
+        Self {
+            hot_data: HotNodeData {
+                center_of_mass,
+                total_mass,
+                bounds_center,
+                bounds_size,
+            },
+            cold_data: ColdNodeData {
+                bounds,
+                children_indices: [None; 8],
+                body_count: 0,
+                node_type: NodeType::Internal,
+            },
+            bodies: OptimizedOctreeBodies::new(),
+        }
+    }
+
+    pub fn new_external(bounds: Aabb3d, capacity: usize) -> Self {
+        let bounds_center = bounds.center();
+        let bounds_size = bounds.size();
+
+        Self {
+            hot_data: HotNodeData {
+                center_of_mass: Vector::ZERO,
+                total_mass: 0.0,
+                bounds_center,
+                bounds_size,
+            },
+            cold_data: ColdNodeData {
+                bounds,
+                children_indices: [None; 8],
+                body_count: 0,
+                node_type: NodeType::External,
+            },
+            bodies: OptimizedOctreeBodies::with_capacity(capacity),
+        }
+    }
+
+    pub fn is_internal(&self) -> bool {
+        self.cold_data.node_type == NodeType::Internal
+    }
+
+    pub fn is_external(&self) -> bool {
+        self.cold_data.node_type == NodeType::External
+    }
+
+    pub fn bounds(&self) -> Aabb3d {
+        self.cold_data.bounds
+    }
+
+    pub fn center_of_mass(&self) -> Vector {
+        self.hot_data.center_of_mass
+    }
+
+    pub fn total_mass(&self) -> Scalar {
+        self.hot_data.total_mass
+    }
+
+    pub fn body_count(&self) -> usize {
+        if self.is_external() {
+            self.bodies.len()
+        } else {
+            self.cold_data.body_count as usize
+        }
+    }
+
+    pub fn add_body(&mut self, entity: Entity, position: Vector, mass: Scalar) {
+        debug_assert!(self.is_external(), "Can only add bodies to external nodes");
+
+        self.bodies.push(entity, position, mass);
+        self.cold_data.body_count = self.bodies.len() as u32;
+
+        // Update center of mass and total mass
+        self.hot_data.total_mass = self.bodies.total_mass();
+        self.hot_data.center_of_mass = self.bodies.center_of_mass();
+    }
+
+    pub fn set_child_index(&mut self, child_index: usize, node_index: Option<u32>) {
+        debug_assert!(child_index < 8, "Child index must be less than 8");
+        debug_assert!(
+            self.is_internal(),
+            "Can only set children on internal nodes"
+        );
+
+        self.cold_data.children_indices[child_index] = node_index;
+    }
+
+    pub fn get_child_index(&self, child_index: usize) -> Option<u32> {
+        debug_assert!(child_index < 8, "Child index must be less than 8");
+        self.cold_data.children_indices[child_index]
+    }
+
+    pub fn update_internal_data(
+        &mut self,
+        center_of_mass: Vector,
+        total_mass: Scalar,
+        body_count: u32,
+    ) {
+        debug_assert!(
+            self.is_internal(),
+            "Can only update internal data on internal nodes"
+        );
+
+        self.hot_data.center_of_mass = center_of_mass;
+        self.hot_data.total_mass = total_mass;
+        self.cold_data.body_count = body_count;
+    }
+}
+
+/// Legacy OctreeNode enum for compatibility during transition
 #[derive(Debug)]
 pub enum OctreeNode {
     Internal {
@@ -563,7 +1349,7 @@ mod tests {
 
     #[test]
     fn test_octree_force_calculation() {
-        let mut octree = Octree::new(0.5, 10.0, 1e4);
+        let mut octree = LegacyOctree::new(0.5, 10.0, 1e4);
 
         let body1 = OctreeBody {
             entity: Entity::from_raw(0),
@@ -592,7 +1378,7 @@ mod tests {
 
     #[test]
     fn test_octree_boundary_handling() {
-        let mut octree = Octree::new(0.5, 10.0, 1e4);
+        let mut octree = LegacyOctree::new(0.5, 10.0, 1e4);
 
         // Create a body exactly at the center (boundary of all octants)
         let center_body = OctreeBody {
@@ -629,7 +1415,7 @@ mod tests {
 
     #[test]
     fn test_octree_no_body_duplication() {
-        let mut octree = Octree::new(0.5, 10.0, 1e4);
+        let mut octree = LegacyOctree::new(0.5, 10.0, 1e4);
 
         // Create bodies, including one exactly on octant boundary
         let bodies = vec![
@@ -665,7 +1451,7 @@ mod tests {
 
     #[test]
     fn test_node_pool_basic_functionality() {
-        let mut pool = OctreeNodePool::new();
+        let mut pool = LegacyOctreeNodePool::new();
 
         // Test getting and returning internal children
         let children1 = pool.get_internal_children();
@@ -701,7 +1487,8 @@ mod tests {
 
     #[test]
     fn test_octree_pool_integration() {
-        let mut octree = Octree::with_pool_capacity(0.5, 10.0, 1e4, 10, 10).with_leaf_threshold(1); // Force tree creation with small leaf threshold
+        let mut octree =
+            LegacyOctree::with_pool_capacity(0.5, 10.0, 1e4, 10, 10).with_leaf_threshold(1); // Force tree creation with small leaf threshold
 
         // Initially pool should be empty
         assert_eq!(octree.pool_stats(), (0, 0));
@@ -780,7 +1567,7 @@ mod tests {
 
     #[test]
     fn test_pool_clear_functionality() {
-        let mut octree = Octree::with_pool_capacity(0.5, 10.0, 1e4, 5, 5);
+        let mut octree = LegacyOctree::with_pool_capacity(0.5, 10.0, 1e4, 5, 5);
 
         // Build and rebuild to populate the pool
         let bodies = vec![
@@ -814,7 +1601,7 @@ mod tests {
 
     #[test]
     fn test_pool_with_capacity() {
-        let octree = Octree::with_pool_capacity(0.5, 10.0, 1e4, 20, 30);
+        let octree = LegacyOctree::with_pool_capacity(0.5, 10.0, 1e4, 20, 30);
         assert_eq!(octree.pool_stats(), (0, 0)); // Should start empty but have capacity
 
         // Test that it has the same functionality as regular octree
@@ -825,7 +1612,7 @@ mod tests {
 
     #[test]
     fn test_node_count_bodies() {
-        let mut octree = Octree::new(0.5, 10.0, 1e4).with_leaf_threshold(2);
+        let mut octree = LegacyOctree::new(0.5, 10.0, 1e4).with_leaf_threshold(2);
 
         // Test with single body (external node)
         let single_body = vec![OctreeBody {
@@ -873,7 +1660,7 @@ mod tests {
 
     #[test]
     fn test_node_is_leaf() {
-        let mut octree = Octree::new(0.5, 10.0, 1e4).with_leaf_threshold(1);
+        let mut octree = LegacyOctree::new(0.5, 10.0, 1e4).with_leaf_threshold(1);
 
         // Test external node (leaf)
         let single_body = vec![OctreeBody {
@@ -910,7 +1697,7 @@ mod tests {
 
     #[test]
     fn test_node_total_mass() {
-        let mut octree = Octree::new(0.5, 10.0, 1e4).with_leaf_threshold(2);
+        let mut octree = LegacyOctree::new(0.5, 10.0, 1e4).with_leaf_threshold(2);
 
         // Test external node mass calculation
         let bodies_external = vec![
@@ -976,7 +1763,7 @@ mod tests {
 
     #[test]
     fn test_node_center_of_mass() {
-        let mut octree = Octree::new(0.5, 10.0, 1e4).with_leaf_threshold(2);
+        let mut octree = LegacyOctree::new(0.5, 10.0, 1e4).with_leaf_threshold(2);
 
         // Test external node center of mass calculation
         let bodies_external = vec![
@@ -1064,7 +1851,7 @@ mod tests {
 
     #[test]
     fn test_node_collect_bounds() {
-        let mut octree = Octree::new(0.5, 10.0, 1e4).with_leaf_threshold(1);
+        let mut octree = LegacyOctree::new(0.5, 10.0, 1e4).with_leaf_threshold(1);
 
         // Create bodies that will force tree subdivision
         let bodies = vec![
@@ -1140,7 +1927,7 @@ mod tests {
 
     #[test]
     fn test_octree_get_bounds_integration() {
-        let mut octree = Octree::new(0.5, 10.0, 1e4).with_leaf_threshold(1);
+        let mut octree = LegacyOctree::new(0.5, 10.0, 1e4).with_leaf_threshold(1);
 
         // Test that octree.get_bounds() uses the moved collect_bounds method correctly
         let bodies = vec![
@@ -1187,7 +1974,7 @@ mod tests {
 
     #[test]
     fn test_octree_stats() {
-        let mut octree = Octree::new(0.5, 1.0, 1e4);
+        let mut octree = LegacyOctree::new(0.5, 1.0, 1e4);
 
         // Test empty octree stats
         let empty_stats = octree.octree_stats();
@@ -1246,7 +2033,7 @@ mod tests {
 
     #[test]
     fn test_count_nodes() {
-        let mut octree = Octree::new(0.5, 1.0, 1e4).with_leaf_threshold(1);
+        let mut octree = LegacyOctree::new(0.5, 1.0, 1e4).with_leaf_threshold(1);
 
         // Single body should create one external node
         let single_body = vec![OctreeBody {
@@ -1258,7 +2045,7 @@ mod tests {
         let stats = octree.octree_stats();
         assert_eq!(stats.node_count, 1, "Single body should create one node");
 
-        octree = Octree::new(0.5, 1.0, 1e4).with_leaf_threshold(1);
+        octree = LegacyOctree::new(0.5, 1.0, 1e4).with_leaf_threshold(1);
 
         // Multiple bodies spread out should create internal nodes (with leaf_threshold=1)
         let multiple_bodies = vec![
@@ -1289,6 +2076,57 @@ mod tests {
         assert_eq!(
             stats.node_count, 5,
             "Four bodies should create five nodes (including the root node)"
+        );
+    }
+
+    #[test]
+    fn test_optimized_octree_root_node_access() {
+        let mut octree = OptimizedOctree::new(0.5, 1.0, 1e4);
+
+        // Test empty octree - should return None
+        assert!(
+            octree.root_node().is_none(),
+            "Empty octree should have no root node"
+        );
+
+        // Create test bodies
+        let bodies = vec![
+            OctreeBody {
+                entity: Entity::from_raw(0),
+                position: Vector::new(0.0, 0.0, 0.0),
+                mass: 100.0,
+            },
+            OctreeBody {
+                entity: Entity::from_raw(1),
+                position: Vector::new(10.0, 0.0, 0.0),
+                mass: 200.0,
+            },
+        ];
+
+        octree.build(bodies);
+
+        // Test populated octree - should return Some(root_node)
+        let root_node = octree.root_node();
+        assert!(
+            root_node.is_some(),
+            "Populated octree should have a root node"
+        );
+
+        let root = root_node.unwrap();
+        assert_eq!(root.body_count(), 2, "Root node should contain both bodies");
+        assert_eq!(
+            root.total_mass(),
+            300.0,
+            "Root node should have total mass of both bodies"
+        );
+
+        // Test that we can access root node data
+        let center_of_mass = root.center_of_mass();
+        let expected_com =
+            (Vector::new(0.0, 0.0, 0.0) * 100.0 + Vector::new(10.0, 0.0, 0.0) * 200.0) / 300.0;
+        assert!(
+            (center_of_mass - expected_com).length() < 1e-10,
+            "Root node center of mass should be correct"
         );
     }
 }

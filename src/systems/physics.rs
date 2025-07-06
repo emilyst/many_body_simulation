@@ -104,7 +104,6 @@ pub fn apply_gravitation_octree(
                     position: Vector::from(transform.translation),
                     mass: mass.value(),
                 },
-                octree.root.as_ref(),
                 **g,
             ));
         });

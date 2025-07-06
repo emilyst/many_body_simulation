@@ -35,7 +35,7 @@ impl Plugin for SimulationPlugin {
         app.insert_resource(resources::BodyCount(config.physics.body_count));
         app.init_resource::<resources::Barycenter>();
         app.insert_resource(resources::GravitationalOctree::new(
-            physics::octree::Octree::new(
+            physics::octree::OptimizedOctree::new(
                 config.physics.octree_theta,
                 config.physics.force_calculation_min_distance,
                 config.physics.force_calculation_max_force,
